@@ -16,7 +16,7 @@ ENV VERSION dev-0.1.0
 ENV DATA_SOURCE_NAME dm://SYSDBA:SYSDBA@localhost:5236?autoCommit=true
 
 COPY --from=build /go/src/dmdb_exporter/dmdb_exporter /dmdb_exporter
-ADD ./default-metrics.toml /default-metrics.toml
+ADD conf/default-metrics.toml /default-metrics.toml
 
 RUN chmod 755 /dmdb_exporter
 

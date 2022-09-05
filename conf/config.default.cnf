@@ -1,0 +1,8 @@
+[client]
+host=127.0.0.1
+port=5236
+user=SYSDBA
+password=SYSDBA
+[client.test]
+user=SYSDBA
+password=SYSDBA

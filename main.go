@@ -7,6 +7,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"net/http"
 	"os"
+	"path"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,6 +22,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/log"
 	"gopkg.in/alecthomas/kingpin.v2"
+	"gopkg.in/ini.v1"
 	//Required for debugging
 	//_ "net/http/pprof"
 )
@@ -29,13 +31,15 @@ var (
 	// Version will be set at build time.
 	Version            = "0.0.0.dev"
 	listenAddress      = kingpin.Flag("web.listen-address", "Address to listen on for web interface and telemetry. (env: LISTEN_ADDRESS)").Default(getEnv("LISTEN_ADDRESS", ":9161")).String()
-	metricPath         = kingpin.Flag("web.telemetry-path", "Path under which to expose metrics. (env: TELEMETRY_PATH)").Default(getEnv("TELEMETRY_PATH", "/metrics")).String()
-	landingPage        = []byte("<html><head><title>DM DB Exporter " + Version + "</title></head><body><h1>DM DB Exporter " + Version + "</h1><p><a href='" + *metricPath + "'>Metrics</a></p></body></html>")
+	metricsPath        = kingpin.Flag("web.telemetry-path", "Path under which to expose metrics. (env: TELEMETRY_PATH)").Default(getEnv("TELEMETRY_PATH", "/metrics")).String()
 	defaultFileMetrics = kingpin.Flag("default.metrics", "File with default metrics in a TOML file. (env: DEFAULT_METRICS)").Default(getEnv("DEFAULT_METRICS", "default-metrics.toml")).String()
 	customMetrics      = kingpin.Flag("custom.metrics", "File that may contain various custom metrics in a TOML file. (env: CUSTOM_METRICS)").Default(getEnv("CUSTOM_METRICS", "")).String()
 	queryTimeout       = kingpin.Flag("query.timeout", "Query timeout (in seconds). (env: QUERY_TIMEOUT)").Default(getEnv("QUERY_TIMEOUT", "5")).String()
 	maxIdleConns       = kingpin.Flag("database.maxIdleConns", "Number of maximum idle connections in the connection pool. (env: DATABASE_MAXIDLECONNS)").Default(getEnv("DM_MAXIDLECONNS", "0")).Int()
 	maxOpenConns       = kingpin.Flag("database.maxOpenConns", "Number of maximum open connections in the connection pool. (env: DATABASE_MAXOPENCONNS)").Default(getEnv("DM_MAXOPENCONNS", "10")).Int()
+	config             = kingpin.Flag("config.cnf", "Path to .my.cnf file to read MySQL credentials from.").Default(path.Join(os.Getenv("HOME"), "config.default.cnf")).String()
+	dsn                string
+	exportConf         *ini.File
 )
 
 // Metric name parts.
@@ -83,8 +87,6 @@ func getEnv(key, fallback string) string {
 	}
 	return fallback
 }
-
-
 
 func connect(dsn string) *sql.DB {
 	log.Debugln("Launching connection: ", dsn)
@@ -197,16 +199,16 @@ func (e *Exporter) scrape(ch chan<- prometheus.Metric) {
 		log.Debugln("Successfully pinged DM database: ")
 		e.up.Set(1)
 	}
-	
+
 	wg := sync.WaitGroup{}
 
 	for _, metric := range metricsToScrap.Metric {
 		wg.Add(1)
-		metric := metric  //https://golang.org/doc/faq#closures_and_goroutines
-		
+		metric := metric //https://golang.org/doc/faq#closures_and_goroutines
+
 		go func() {
 			defer wg.Done()
-			
+
 			log.Debugln("About to scrape metric: ")
 			log.Debugln("- Metric MetricsDesc: ", metric.MetricsDesc)
 			log.Debugln("- Metric Context: ", metric.Context)
@@ -387,6 +389,7 @@ func main() {
 
 	log.Infoln("Starting dmdb_exporter " + Version)
 	dsn := os.Getenv("DATA_SOURCE_NAME")
+	//dsn := "dm://SYSDBA:SYSDBA@127.0.0.1:5236?autoCommit=true"
 	// Load default metrics
 	if _, err := toml.DecodeFile(*defaultFileMetrics, &metricsToScrap); err != nil {
 		log.Errorln(err)
@@ -408,16 +411,127 @@ func main() {
 	} else {
 		log.Infoln("No custom metrics defined.")
 	}
-	exporter := NewExporter(dsn)
+	if dsn != "" {
+		exporter := NewExporter(dsn)
+		prometheus.MustRegister(exporter)
+	} else {
+		var err error
+		if exportConf, err = newExporterConfig(*config); err != nil {
+			log.Infof("Error parsing config, file: %s, err: %v", *config, err)
+			os.Exit(1)
+		}
+		http.HandleFunc("/scrape", scrapeHandle())
+	}
+	//exporter := NewExporter(dsn)
 	//prometheus.MustRegister(exporter)
-	registry := prometheus.NewRegistry()
-	registry.MustRegister(exporter)
+	//registry := prometheus.NewRegistry()
+	//registry.MustRegister(exporter)
 	//http.Handle(*metricPath,  promhttp.Handler())
 
-	http.Handle(*metricPath,promhttp.HandlerFor(registry,promhttp.HandlerOpts{}))
+	// landingPage contains the HTML served at '/'.
+	// TODO: Make this nicer and more informative.
+	var landingPage = []byte(`<html>
+	        <head><title>Dmdb Exporter</title></head>
+	        <body>
+	        <h1>Dmdb Exporter</h1>
+	        <p><a href='` + *metricsPath + `'>Metrics</a></p>
+	        </body>
+	        </html>`)
+
+	//http.Handle(*metricsPath, promhttp.HandlerFor(registry, promhttp.HandlerOpts{}))
+
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Write(landingPage)
 	})
 	log.Infoln("Listening on", *listenAddress)
 	log.Fatal(http.ListenAndServe(*listenAddress, nil))
+}
+
+func scrapeHandle() func(w http.ResponseWriter, r *http.Request) {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var err error
+		target := r.URL.Query().Get("target")
+		module := r.URL.Query().Get("module")
+
+		if dsn, err = formExporterDSN(target, module, exportConf); err != nil {
+			log.Infof("Error parsing target, target: %s, err: %v", target, err)
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		exporter := NewExporter(dsn)
+		registry := prometheus.NewRegistry()
+		registry.MustRegister(exporter)
+		gatherers := prometheus.Gatherers{
+			prometheus.DefaultGatherer,
+			registry,
+		}
+		h := promhttp.HandlerFor(gatherers, promhttp.HandlerOpts{})
+		h.ServeHTTP(w, r)
+	}
+}
+
+func formExporterDSN(target string, module string, cfg *ini.File) (string, error) {
+	var dsn, host string
+	var port uint
+	var client *ini.Section
+	var err error
+
+	// parse specific target
+	if target != "" {
+		targetPort := strings.Split(target, ":")
+		host = targetPort[0]
+		if len(targetPort) > 1 {
+			p, err := strconv.ParseUint(targetPort[1], 10, 64)
+			if err != nil {
+				return "", fmt.Errorf("invalid port %s", targetPort[1])
+			}
+			port = uint(p)
+		}
+	}
+
+	// Get client config
+	var section string
+	if module == "" || module == "default" {
+		section = "client"
+	} else {
+		section = fmt.Sprintf("client.%s", module)
+	}
+
+	if client, err = cfg.GetSection(section); err != nil {
+		return "", fmt.Errorf("didn't find section [%s] in config", section)
+	}
+
+	// default host & port
+	if host == "" {
+		host = cfg.Section("client").Key("host").MustString("localhost")
+	}
+	if port == 0 {
+		port = cfg.Section("client").Key("port").MustUint(3306)
+	}
+
+	user := client.Key("user").String()
+	password := client.Key("password").String()
+	if (user == "") || (password == "") {
+		return dsn, fmt.Errorf("no user or password specified under [%s] in config", section)
+	}
+
+	dsn = fmt.Sprintf("dm://%s:%s@%s:%v?autoCommit=true", user, password, host, port)
+
+	return dsn, nil
+}
+
+func newExporterConfig(configPath interface{}) (*ini.File, error) {
+	opts := ini.LoadOptions{
+		// MySQL ini file can have boolean keys.
+		AllowBooleanKeys: true,
+	}
+
+	var cfg *ini.File
+	var err error
+	if cfg, err = ini.LoadSources(opts, configPath); err != nil {
+		return nil, err
+	}
+
+	return cfg, nil
 }
